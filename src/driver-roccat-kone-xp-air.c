@@ -641,6 +641,8 @@ kxa_apply_settings(struct ratbag_profile *profile)
 		s[KXA_S_ANGLE_SNAPPING] = profile->angle_snapping ? 1 : 0;
 
 	ratbag_profile_for_each_led(profile, led) {
+		unsigned int brightness;
+
 		if (!led->dirty)
 			continue;
 
@@ -662,11 +664,20 @@ kxa_apply_settings(struct ratbag_profile *profile)
 			return -EINVAL;
 		}
 
-		/* brightness is linear 0-255; "on" with 0 would stay dark, so use full */
-		if (led->brightness == 0 || led->brightness > 255)
-			s[KXA_S_BRIGHTNESS] = 255;
+		/*
+		 * Brightness is byte 32 in every effect, linear 0-255, and 00 turns
+		 * the LEDs off (Swarm II writes 00 at the bottom of its slider in
+		 * Fully Lit, Breathe and Colorwave). Write it as given, 0 included.
+		 * The one exception is switching on from "off": the stored value is
+		 * then 00, so use full brightness or the LED would stay dark.
+		 */
+		if (led->brightness > 255)
+			brightness = 255;
 		else
-			s[KXA_S_BRIGHTNESS] = led->brightness;
+			brightness = led->brightness;
+		if (brightness == 0 && s[KXA_S_BRIGHTNESS] == 0)
+			brightness = 255;
+		s[KXA_S_BRIGHTNESS] = brightness;
 
 		/* duration -> Swarm's 8-step speed slider; 0 keeps the stored speed */
 		if ((led->mode == RATBAG_LED_BREATHING || led->mode == RATBAG_LED_CYCLE) && led->ms) {
