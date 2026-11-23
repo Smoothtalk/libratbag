@@ -622,8 +622,20 @@ kxa_encode_button(struct ratbag_button *button)
 		memset(e, 0, KXA_B_ENTRY_SIZE);
 		return 0;
 	case RATBAG_BUTTON_ACTION_TYPE_KEY: {
-		uint8_t usage = ratbag_hidraw_get_keyboard_usage_from_keycode(device,
-									      action->action.key);
+		uint8_t usage;
+
+		/* keys Swarm has its own entry for (Insert, Ctrl, ...) use type 04 */
+		ARRAY_FOR_EACH(kxa_button_map, m) {
+			if (ratbag_button_action_match(&m->action, action)) {
+				e[0] = 0;
+				e[1] = 0;
+				e[2] = m->code;
+				e[3] = m->type;
+				return 0;
+			}
+		}
+
+		usage = ratbag_hidraw_get_keyboard_usage_from_keycode(device, action->action.key);
 		if (!usage)
 			return -EINVAL;
 		e[0] = 0;
