@@ -106,6 +106,7 @@
 
 #define KXA_EFFECT_STATIC		0x01
 #define KXA_EFFECT_BREATHING		0x03
+#define KXA_EFFECT_CYCLE		0x0a	/* probably AIMO: the mouse cycles colours itself */
 
 /* Button block (cmd 0x47) */
 #define KXA_BUTTONS_SIZE		125
@@ -448,8 +449,9 @@ kxa_parse_settings(struct ratbag_profile *profile)
 
 	/*
 	 * One logical LED: the five user colour groups always carry the same
-	 * colour in Swarm II. Effects other than static/breathing (e.g. 0x0a)
-	 * are shown as "on" and left untouched unless the LED is changed.
+	 * colour in Swarm II. Effect 0x0a (probably AIMO) makes the mouse run
+	 * a rainbow cycle on its own, so it is shown as "cycle". Other unknown
+	 * effects are shown as "on" and left untouched unless the LED is changed.
 	 */
 	group = kxa_color_group(s, KXA_S_USER_GROUP_FIRST);
 	ratbag_profile_for_each_led(profile, led) {
@@ -457,6 +459,7 @@ kxa_parse_settings(struct ratbag_profile *profile)
 		ratbag_led_set_mode_capability(led, RATBAG_LED_OFF);
 		ratbag_led_set_mode_capability(led, RATBAG_LED_ON);
 		ratbag_led_set_mode_capability(led, RATBAG_LED_BREATHING);
+		ratbag_led_set_mode_capability(led, RATBAG_LED_CYCLE);
 
 		led->color.red = group[2];
 		led->color.green = group[3];
@@ -467,6 +470,8 @@ kxa_parse_settings(struct ratbag_profile *profile)
 			led->mode = RATBAG_LED_OFF;
 		else if (s[KXA_S_EFFECT] == KXA_EFFECT_BREATHING)
 			led->mode = RATBAG_LED_BREATHING;
+		else if (s[KXA_S_EFFECT] == KXA_EFFECT_CYCLE)
+			led->mode = RATBAG_LED_CYCLE;
 		else
 			led->mode = RATBAG_LED_ON;
 	}
@@ -532,6 +537,9 @@ kxa_apply_settings(struct ratbag_profile *profile)
 		case RATBAG_LED_BREATHING:
 			s[KXA_S_EFFECT] = KXA_EFFECT_BREATHING;
 			break;
+		case RATBAG_LED_CYCLE:
+			s[KXA_S_EFFECT] = KXA_EFFECT_CYCLE;
+			break;
 		default:
 			return -EINVAL;
 		}
@@ -541,6 +549,11 @@ kxa_apply_settings(struct ratbag_profile *profile)
 			s[KXA_S_BRIGHTNESS] = 255;
 		else
 			s[KXA_S_BRIGHTNESS] = led->brightness;
+
+		/* the cycle picks its own colours; keep the groups as they are */
+		if (led->mode == RATBAG_LED_CYCLE)
+			continue;
+
 		for (unsigned int g = KXA_S_USER_GROUP_FIRST; g <= KXA_S_USER_GROUP_LAST; g++) {
 			uint8_t *group = kxa_color_group(s, g);
 
