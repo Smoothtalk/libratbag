@@ -657,12 +657,14 @@ static int
 kxa_test_hidraw(struct ratbag_device *device)
 {
 	/*
-	 * Interface 2's vendor collection owns feature report 0x06. The mouse
-	 * collection on interface 0 may also list a report 0x06, so check the
-	 * usage page too.
+	 * Interface 2's vendor collection (usage page 0xff03) owns feature
+	 * report 0x06; that is the one Swarm II talks to. Interface 0 also
+	 * declares a 29-byte vendor feature report 0x06 (page 0xff00) inside
+	 * the mouse collection. Windows hides it, Linux hidraw does not.
+	 * Accept only pages above 0xff00 so exactly one interface matches.
 	 */
 	return ratbag_hidraw_has_report(device, KXA_REPORT_ID) &&
-	       ratbag_hidraw_get_usage_page(device, KXA_REPORT_ID) >= 0xff00;
+	       ratbag_hidraw_get_usage_page(device, KXA_REPORT_ID) > 0xff00;
 }
 
 static void
@@ -696,9 +698,19 @@ kxa_probe(struct ratbag_device *device)
 		return -ENODEV;
 	}
 
-	rc = ratbag_find_hidraw(device, kxa_test_hidraw);
+	/*
+	 * ratbagd creates one ratbag device per hidraw node, so only claim
+	 * the mouse from the node that is itself the protocol interface.
+	 * ratbag_find_hidraw() would search all sibling interfaces and let
+	 * every node of the dongle claim it, listing the mouse several times.
+	 */
+	rc = ratbag_open_hidraw(device);
 	if (rc)
 		return rc;
+	if (!kxa_test_hidraw(device)) {
+		ratbag_close_hidraw(device);
+		return -ENODEV;
+	}
 
 	drv_data = zalloc(sizeof(*drv_data));
 	drv_data->target = device->ids.product == KXA_PID_DONGLE ?
