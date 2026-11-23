@@ -71,6 +71,7 @@
 #define KXA_TARGET_LOCAL		0x00
 #define KXA_TARGET_WIRELESS		0x01
 
+#define KXA_CMD_DONGLE			0x00	/* dongle itself, target 00 */
 #define KXA_CMD_STATUS			0x44
 #define KXA_CMD_PROFILE			0x45
 #define KXA_CMD_SETTINGS		0x46
@@ -79,6 +80,8 @@
 #define KXA_OP_WRITE			0x06
 #define KXA_OP_READ			0x07
 #define KXA_OP_REPLY			0x08
+#define KXA_OP_ATTACH			0x04	/* cmd 0x00: start forwarding to the mouse */
+#define KXA_OP_NOT_FORWARDING		0x0c	/* dongle reply before KXA_OP_ATTACH */
 
 #define KXA_NUM_PROFILES		5
 #define KXA_NUM_DPI			5
@@ -231,6 +234,11 @@ kxa_recv(struct ratbag_device *device, uint8_t cmd, uint8_t *payload, size_t max
 	if (rc != (int)sizeof(buf))
 		return -EIO;
 
+	if (buf[0] == KXA_REPORT_ID && buf[2] == cmd && buf[3] == KXA_OP_NOT_FORWARDING) {
+		log_debug(device->ratbag,
+			  "kone-xp-air: dongle isn't forwarding to the mouse (cmd 0x%02x)\n", cmd);
+		return -ENOTCONN;
+	}
 	if (buf[0] != KXA_REPORT_ID || buf[2] != cmd || buf[3] != KXA_OP_REPLY) {
 		log_error(device->ratbag,
 			  "kone-xp-air: unexpected reply %02x %02x %02x %02x to cmd 0x%02x\n",
@@ -373,6 +381,28 @@ kxa_write_block(struct ratbag_device *device, uint8_t cmd, unsigned int profile,
 	}
 
 	return 0;
+}
+
+/*
+ * A freshly plugged dongle answers every mouse command with op 0x0c until the
+ * host sends cmd 0x00 op 0x04 to the dongle itself (target 00). Swarm II sends
+ * this first after every replug; its reply is empty (06 00 00 08 00 ...).
+ */
+static int
+kxa_dongle_attach(struct ratbag_device *device)
+{
+	struct kxa_data *drv_data = ratbag_get_drv_data(device);
+	uint8_t target = drv_data->target;
+	uint8_t reply[KXA_REPORT_SIZE];
+	int rc;
+
+	drv_data->target = KXA_TARGET_LOCAL;
+	rc = kxa_send(device, KXA_CMD_DONGLE, KXA_OP_ATTACH, NULL, 0);
+	if (rc == 0)
+		rc = kxa_recv(device, KXA_CMD_DONGLE, reply, sizeof(reply));
+	drv_data->target = target;
+
+	return rc < 0 ? rc : 0;
 }
 
 static int
@@ -742,6 +772,13 @@ kxa_probe(struct ratbag_device *device)
 			   KXA_TARGET_WIRELESS : KXA_TARGET_LOCAL;
 	kxa_build_dpi_list(drv_data);
 	ratbag_set_drv_data(device, drv_data);
+
+	if (device->ids.product == KXA_PID_DONGLE) {
+		rc = kxa_dongle_attach(device);
+		if (rc)
+			log_error(device->ratbag, "kone-xp-air: dongle attach failed: %s\n",
+				  strerror(-rc));
+	}
 
 	active = kxa_read_active_profile(device);
 	if (active < 0) {
