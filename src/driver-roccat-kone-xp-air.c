@@ -56,6 +56,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+#include <libudev.h>
 
 #include "libratbag-private.h"
 #include "libratbag-hidraw.h"
@@ -72,6 +73,7 @@
 #define KXA_TARGET_WIRELESS		0x01
 
 #define KXA_CMD_DONGLE			0x00	/* dongle itself, target 00 */
+#define KXA_CMD_DEBOUNCE		0x43	/* device-wide, one 19-byte packet */
 #define KXA_CMD_STATUS			0x44
 #define KXA_CMD_PROFILE			0x45
 #define KXA_CMD_SETTINGS		0x46
@@ -99,17 +101,32 @@
 #define KXA_S_DPI_MASK			5
 #define KXA_S_DPI_ACTIVE		6
 #define KXA_S_DPI_TABLE			7	/* 5 x u16 LE */
+#define KXA_S_ANGLE_SNAPPING		27	/* 00 off, 01 on */
 #define KXA_S_REPORT_RATE		29
 #define KXA_S_EFFECT			30
+#define KXA_S_EFFECT_SPEED		31	/* 1 (slow) .. 8 (fast) */
 #define KXA_S_BRIGHTNESS		32
 #define KXA_S_COLOR_GROUPS		36	/* 8 groups of 5 bytes: <a> <b> R G B */
 #define KXA_S_COLOR_GROUP_SIZE		5
 #define KXA_S_USER_GROUP_FIRST		1	/* groups 1..5 carry the static colour */
 #define KXA_S_USER_GROUP_LAST		5
 
+/*
+ * Effects (Swarm II names): 01 Fully Lit, 02 Blink, 03 Breathe, 04 Heartbeat,
+ * 05 Photon, 09 AIMO, 0a Colorwave, 13 Battery Indication. libratbag can show
+ * on / breathing / cycle; Colorwave is the one that cycles colours by itself.
+ */
 #define KXA_EFFECT_STATIC		0x01
 #define KXA_EFFECT_BREATHING		0x03
-#define KXA_EFFECT_CYCLE		0x0a	/* probably AIMO: the mouse cycles colours itself */
+#define KXA_EFFECT_CYCLE		0x0a	/* Colorwave */
+
+#define KXA_SPEED_MIN			1
+#define KXA_SPEED_MAX			8
+#define KXA_SPEED_STEP_MS		500	/* speed 8 = 500 ms ... speed 1 = 4000 ms */
+
+/* Debounce (cmd 0x43): 11 0d 00 <ms> <ms> 0a x12 <u16 LE sum of the 17 bytes> */
+#define KXA_DEBOUNCE_SIZE		19
+#define KXA_D_MS			3
 
 /* Button block (cmd 0x47) */
 #define KXA_BUTTONS_SIZE		125
@@ -122,6 +139,7 @@
 /* Button entry: 00 <p1> <p2> <type> */
 #define KXA_BTN_TYPE_STANDARD		0x01
 #define KXA_BTN_TYPE_DPI		0x02
+#define KXA_BTN_TYPE_MEDIA		0x03
 #define KXA_BTN_TYPE_KEYS		0x04
 #define KXA_BTN_TYPE_HOTKEY		0x06	/* p1 = HID usage, p2 = modifiers */
 #define KXA_BTN_TYPE_PROFILES		0x08
@@ -131,12 +149,15 @@
 #define KXA_DPI_MAX			19000	/* product spec, not verified on the device */
 
 static const unsigned int kxa_report_rates[] = { 125, 250, 500, 1000 };
+static const unsigned int kxa_debounces[] = { 2, 3, 5, 8, 10 };	/* what Swarm II offers */
 
 struct kxa_data {
 	uint8_t target;
 	uint8_t profile_count;
 	uint8_t settings[KXA_NUM_PROFILES][KXA_SETTINGS_SIZE];
 	uint8_t buttons[KXA_NUM_PROFILES][KXA_BUTTONS_SIZE];
+	uint8_t debounce[KXA_DEBOUNCE_SIZE];
+	bool has_debounce;
 	unsigned int dpis[300];
 	size_t ndpis;
 };
@@ -149,8 +170,10 @@ struct kxa_button_mapping {
 
 /*
  * <type> is Swarm's function category, <code> the 1-based position in that
- * category's list. Confirmed: standard 03/05/06/09/0a, DPI 01-03, keys 01/04,
- * profiles 01, hotkeys. The rest follows Swarm's list order (likely).
+ * category's list. Confirmed: standard 03/04/05/06/09/0a, DPI 01-03, keys
+ * 01/04/07, media 04, profiles 01/02, hotkeys. Media 02/03/07/08 come from the
+ * quick start guide's Easy-Shift defaults. The rest follows Swarm's list order
+ * (likely).
  * Browser Back/Forward are mapped to buttons 4/5 like the other ROCCAT drivers.
  */
 static const struct kxa_button_mapping kxa_button_map[] = {
@@ -167,6 +190,11 @@ static const struct kxa_button_mapping kxa_button_map[] = {
 	{ KXA_BTN_TYPE_DPI, 0x01, BUTTON_ACTION_SPECIAL(RATBAG_BUTTON_ACTION_SPECIAL_RESOLUTION_CYCLE_UP) },
 	{ KXA_BTN_TYPE_DPI, 0x02, BUTTON_ACTION_SPECIAL(RATBAG_BUTTON_ACTION_SPECIAL_RESOLUTION_UP) },
 	{ KXA_BTN_TYPE_DPI, 0x03, BUTTON_ACTION_SPECIAL(RATBAG_BUTTON_ACTION_SPECIAL_RESOLUTION_DOWN) },
+	{ KXA_BTN_TYPE_MEDIA, 0x02, BUTTON_ACTION_KEY(KEY_PREVIOUSSONG) },
+	{ KXA_BTN_TYPE_MEDIA, 0x03, BUTTON_ACTION_KEY(KEY_NEXTSONG) },
+	{ KXA_BTN_TYPE_MEDIA, 0x04, BUTTON_ACTION_KEY(KEY_PLAYPAUSE) },
+	{ KXA_BTN_TYPE_MEDIA, 0x07, BUTTON_ACTION_KEY(KEY_VOLUMEUP) },
+	{ KXA_BTN_TYPE_MEDIA, 0x08, BUTTON_ACTION_KEY(KEY_VOLUMEDOWN) },
 	{ KXA_BTN_TYPE_KEYS, 0x01, BUTTON_ACTION_KEY(KEY_INSERT) },
 	{ KXA_BTN_TYPE_KEYS, 0x02, BUTTON_ACTION_KEY(KEY_DELETE) },
 	{ KXA_BTN_TYPE_KEYS, 0x03, BUTTON_ACTION_KEY(KEY_HOME) },
@@ -426,6 +454,47 @@ kxa_read_active_profile(struct ratbag_device *device)
 	return payload[0];
 }
 
+static int
+kxa_read_debounce(struct ratbag_device *device)
+{
+	struct kxa_data *drv_data = ratbag_get_drv_data(device);
+	uint8_t payload[KXA_REPORT_SIZE];
+	int rc;
+
+	rc = kxa_send(device, KXA_CMD_DEBOUNCE, KXA_OP_READ, NULL, 0);
+	if (rc)
+		return rc;
+	rc = kxa_recv(device, KXA_CMD_DEBOUNCE, payload, sizeof(payload));
+	if (rc < 0)
+		return rc;
+	if (rc != KXA_DEBOUNCE_SIZE || payload[0] != 0x11 || payload[1] != 0x0d ||
+	    !kxa_checksum_is_valid(payload, KXA_DEBOUNCE_SIZE))
+		return -EIO;
+
+	memcpy(drv_data->debounce, payload, KXA_DEBOUNCE_SIZE);
+	drv_data->has_debounce = true;
+
+	return 0;
+}
+
+/*
+ * The mouse ignores the trailing sum it is sent and stores its own (Swarm II
+ * sends junk there), but we send the correct one anyway.
+ */
+static int
+kxa_write_debounce(struct ratbag_device *device, unsigned int ms)
+{
+	struct kxa_data *drv_data = ratbag_get_drv_data(device);
+	uint8_t payload[KXA_DEBOUNCE_SIZE];
+
+	memcpy(payload, drv_data->debounce, sizeof(payload));
+	payload[KXA_D_MS] = ms;
+	payload[KXA_D_MS + 1] = ms;
+	kxa_checksum_update(payload, sizeof(payload));
+
+	return kxa_send_write(device, KXA_CMD_DEBOUNCE, payload, sizeof(payload));
+}
+
 /* ---------------------------------------------------------------------- */
 /* Settings <-> libratbag                                                  */
 /* ---------------------------------------------------------------------- */
@@ -477,11 +546,25 @@ kxa_parse_settings(struct ratbag_profile *profile)
 		resolution->is_active = (resolution->index == (unsigned int)s[KXA_S_DPI_ACTIVE]);
 	}
 
+	if (s[KXA_S_ANGLE_SNAPPING] <= 1)
+		profile->angle_snapping = s[KXA_S_ANGLE_SNAPPING];
+	else
+		log_debug(device->ratbag, "kone-xp-air: unknown angle snapping value %u\n",
+			  s[KXA_S_ANGLE_SNAPPING]);
+
+	/* debounce is device-wide; libratbag keeps it per profile, so mirror it */
+	if (drv_data->has_debounce) {
+		ratbag_profile_set_debounce_list(profile, kxa_debounces,
+						 ARRAY_LENGTH(kxa_debounces));
+		profile->debounce = drv_data->debounce[KXA_D_MS];
+	}
+
 	/*
 	 * One logical LED: the five user colour groups always carry the same
-	 * colour in Swarm II. Effect 0x0a (probably AIMO) makes the mouse run
-	 * a rainbow cycle on its own, so it is shown as "cycle". Other unknown
-	 * effects are shown as "on" and left untouched unless the LED is changed.
+	 * colour in Swarm II. Effect 0x0a (Colorwave) makes the mouse run a
+	 * rainbow cycle on its own, so it is shown as "cycle". The other effects
+	 * (blink, heartbeat, photon, AIMO, battery) are shown as "on" and left
+	 * untouched unless the LED is changed.
 	 */
 	group = kxa_color_group(s, KXA_S_USER_GROUP_FIRST);
 	ratbag_profile_for_each_led(profile, led) {
@@ -495,6 +578,8 @@ kxa_parse_settings(struct ratbag_profile *profile)
 		led->color.green = group[3];
 		led->color.blue = group[4];
 		led->brightness = s[KXA_S_BRIGHTNESS];
+		if (s[KXA_S_EFFECT_SPEED] >= KXA_SPEED_MIN && s[KXA_S_EFFECT_SPEED] <= KXA_SPEED_MAX)
+			led->ms = (KXA_SPEED_MAX + 1 - s[KXA_S_EFFECT_SPEED]) * KXA_SPEED_STEP_MS;
 
 		if (s[KXA_S_BRIGHTNESS] == 0)
 			led->mode = RATBAG_LED_OFF;
@@ -552,6 +637,9 @@ kxa_apply_settings(struct ratbag_profile *profile)
 	s[KXA_S_DPI_MASK] = mask;
 	s[KXA_S_DPI_ACTIVE] = active;
 
+	if (profile->angle_snapping_dirty)
+		s[KXA_S_ANGLE_SNAPPING] = profile->angle_snapping ? 1 : 0;
+
 	ratbag_profile_for_each_led(profile, led) {
 		if (!led->dirty)
 			continue;
@@ -579,6 +667,18 @@ kxa_apply_settings(struct ratbag_profile *profile)
 			s[KXA_S_BRIGHTNESS] = 255;
 		else
 			s[KXA_S_BRIGHTNESS] = led->brightness;
+
+		/* duration -> Swarm's 8-step speed slider; 0 keeps the stored speed */
+		if ((led->mode == RATBAG_LED_BREATHING || led->mode == RATBAG_LED_CYCLE) && led->ms) {
+			int speed = KXA_SPEED_MAX + 1 -
+				    (int)((led->ms + KXA_SPEED_STEP_MS / 2) / KXA_SPEED_STEP_MS);
+
+			if (speed < KXA_SPEED_MIN)
+				speed = KXA_SPEED_MIN;
+			if (speed > KXA_SPEED_MAX)
+				speed = KXA_SPEED_MAX;
+			s[KXA_S_EFFECT_SPEED] = speed;
+		}
 
 		/* the cycle picks its own colours; keep the groups as they are */
 		if (led->mode == RATBAG_LED_CYCLE)
@@ -736,6 +836,26 @@ kxa_build_dpi_list(struct kxa_data *drv_data)
 	assert(drv_data->ndpis <= ARRAY_LENGTH(drv_data->dpis));
 }
 
+/* Swarm II shows the USB bcdDevice as the version: 0x0113 -> "1.13", 0x0003 -> "0.3" */
+static void
+kxa_set_firmware_version(struct ratbag_device *device)
+{
+	struct udev_device *usb;
+	const char *bcd;
+	unsigned int v;
+	char fw[16];
+
+	usb = udev_device_get_parent_with_subsystem_devtype(device->udev_device, "usb", "usb_device");
+	if (!usb)
+		return;
+	bcd = udev_device_get_sysattr_value(usb, "bcdDevice");
+	if (!bcd || sscanf(bcd, "%x", &v) != 1)
+		return;
+
+	snprintf(fw, sizeof(fw), "%x.%x", (v >> 8) & 0xff, v & 0xff);
+	ratbag_device_set_firmware_version(device, fw);
+}
+
 static int
 kxa_probe(struct ratbag_device *device)
 {
@@ -798,6 +918,13 @@ kxa_probe(struct ratbag_device *device)
 		active = 0;
 	}
 
+	rc = kxa_read_debounce(device);
+	if (rc)
+		log_debug(device->ratbag, "kone-xp-air: can't read debounce (%s), not offering it\n",
+			  strerror(-rc));
+
+	kxa_set_firmware_version(device);
+
 	ratbag_device_init_profiles(device, KXA_NUM_PROFILES, KXA_NUM_DPI,
 				    KXA_NUM_BUTTONS, KXA_NUM_LEDS);
 
@@ -837,8 +964,34 @@ kxa_commit(struct ratbag_device *device)
 	struct ratbag_led *led;
 	int rc;
 
+	/* debounce is device-wide: write it once, then mirror it into every profile */
 	ratbag_device_for_each_profile(device, profile) {
-		bool settings_dirty = profile->rate_dirty;
+		struct ratbag_profile *other;
+
+		if (!profile->debounce_dirty || !drv_data->has_debounce)
+			continue;
+
+		if (profile->debounce <= 0 || profile->debounce > 0xff) {
+			log_error(device->ratbag, "kone-xp-air: unsupported debounce %d ms\n",
+				  profile->debounce);
+			return -EINVAL;
+		}
+		rc = kxa_write_debounce(device, profile->debounce);
+		if (rc)
+			return rc;
+		drv_data->debounce[KXA_D_MS] = profile->debounce;
+		drv_data->debounce[KXA_D_MS + 1] = profile->debounce;
+		kxa_checksum_update(drv_data->debounce, KXA_DEBOUNCE_SIZE);
+
+		ratbag_device_for_each_profile(device, other) {
+			other->debounce = profile->debounce;
+			other->debounce_dirty = false;
+		}
+		break;
+	}
+
+	ratbag_device_for_each_profile(device, profile) {
+		bool settings_dirty = profile->rate_dirty || profile->angle_snapping_dirty;
 		bool buttons_dirty = false;
 		uint8_t *b = drv_data->buttons[profile->index];
 
