@@ -1,0 +1,5 @@
+[Device]
+Name=Turtle Beach Kone XP Air
+DeviceMatch=usb:10f5:5015;usb:10f5:5017
+Driver=roccat-kone-xp-air
+DeviceType=mouse
