@@ -57,6 +57,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <libudev.h>
+#include <sys/file.h>
 
 #include "libratbag-private.h"
 #include "libratbag-hidraw.h"
@@ -819,6 +820,36 @@ kxa_encode_button(struct ratbag_button *button)
 /* Driver hooks                                                            */
 /* ---------------------------------------------------------------------- */
 
+/*
+ * The mouse has one reply buffer, so two programs talking to it at once get
+ * each other's replies. Other tools (e.g. kone-xp-air-re's battery script)
+ * take an exclusive flock() on the same hidraw node around their packets; we
+ * hold it for each whole transaction (probe, commit, profile switch). If
+ * someone keeps it for more than 2 s, go ahead without it rather than hang.
+ */
+#define KXA_LOCK_TIMEOUT_MS		2000
+
+static void
+kxa_lock(struct ratbag_device *device)
+{
+	int fd = device->hidraw[0].fd;
+
+	for (int waited = 0; waited < KXA_LOCK_TIMEOUT_MS; waited += 20) {
+		if (flock(fd, LOCK_EX | LOCK_NB) == 0)
+			return;
+		if (errno != EWOULDBLOCK && errno != EINTR)
+			break;
+		msleep(20);
+	}
+	log_debug(device->ratbag, "kone-xp-air: couldn't lock the hidraw node, continuing\n");
+}
+
+static void
+kxa_unlock(struct ratbag_device *device)
+{
+	flock(device->hidraw[0].fd, LOCK_UN);
+}
+
 static int
 kxa_test_hidraw(struct ratbag_device *device)
 {
@@ -898,6 +929,8 @@ kxa_probe(struct ratbag_device *device)
 		return -ENODEV;
 	}
 
+	kxa_lock(device);
+
 	drv_data = zalloc(sizeof(*drv_data));
 	drv_data->target = device->ids.product == KXA_PID_DONGLE ?
 			   KXA_TARGET_WIRELESS : KXA_TARGET_LOCAL;
@@ -956,9 +989,11 @@ kxa_probe(struct ratbag_device *device)
 		profile->is_active = (profile->index == (unsigned int)active);
 	}
 
+	kxa_unlock(device);
 	return 0;
 
 err:
+	kxa_unlock(device);
 	ratbag_close_hidraw(device);
 	free(drv_data);
 	ratbag_set_drv_data(device, NULL);
@@ -966,7 +1001,7 @@ err:
 }
 
 static int
-kxa_commit(struct ratbag_device *device)
+kxa_commit_locked(struct ratbag_device *device)
 {
 	struct kxa_data *drv_data = ratbag_get_drv_data(device);
 	struct ratbag_profile *profile;
@@ -1054,15 +1089,32 @@ kxa_commit(struct ratbag_device *device)
 }
 
 static int
+kxa_commit(struct ratbag_device *device)
+{
+	int rc;
+
+	kxa_lock(device);
+	rc = kxa_commit_locked(device);
+	kxa_unlock(device);
+
+	return rc;
+}
+
+static int
 kxa_set_active_profile(struct ratbag_device *device, unsigned int index)
 {
 	struct kxa_data *drv_data = ratbag_get_drv_data(device);
 	uint8_t payload[2] = { index, drv_data->profile_count };
+	int rc;
 
 	if (index >= KXA_NUM_PROFILES)
 		return -EINVAL;
 
-	return kxa_send_write(device, KXA_CMD_PROFILE, payload, sizeof(payload));
+	kxa_lock(device);
+	rc = kxa_send_write(device, KXA_CMD_PROFILE, payload, sizeof(payload));
+	kxa_unlock(device);
+
+	return rc;
 }
 
 static void
